@@ -10,7 +10,6 @@ import akka.util.ByteString
 import java.nio.ByteBuffer
 import java.nio.file.{ Files, Path, Paths }
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 import akka.stream._
 import akka.{ Done, NotUsed }
@@ -76,7 +75,7 @@ object NonBlockingProcess {
   def props(
     command: immutable.Seq[String],
     workingDir: Path = Paths.get(System.getProperty("user.dir")),
-    environment: Map[String, String] = Map.empty) =
+    environment: Map[String, String] = Map.empty)(implicit mat: Materializer) =
     Props(new NonBlockingProcess(command, workingDir, environment))
 
   // For additional process detection for platforms that support "/proc"
@@ -131,7 +130,7 @@ object NonBlockingProcess {
 class NonBlockingProcess(
   command: immutable.Seq[String],
   directory: Path,
-  environment: Map[String, String])
+  environment: Map[String, String])(implicit mat: Materializer)
     extends Actor with ActorLogging {
 
   import NonBlockingProcess._
@@ -168,16 +167,6 @@ class NonBlockingProcess(
 
     pb.setProcessListener(new NuAbstractProcessHandler {
       override def onPreStart(nuProcess: NuProcess): Unit = {
-        // Create our stream based actors away from this one given that we want them to continue
-        // for a small while post the actor dying (it may take a tiny bit longer for the process
-        // to terminate). Given the latent completion, we also ensure that the materializer is
-        // shutdown when we know we no longer require it. We use a reference counter for tracking
-        // usage. When either stdout or stderr are completed then we decrement the ref counter.
-        // When there are zero refs then we shutdown the materializer. Note that it is possible
-        // for a process to cause the exit handler to be invoked without having started (in the
-        // case of an error). We handle this scenario also.
-        val stdioMaterializer = ActorMaterializer()(context.system)
-        val stdioMaterializerRefCount = new AtomicInteger(2)
         val stdin =
           Sink
             .foreach[ByteString](bytes => nuProcess.writeStdin(bytes.toByteBuffer))
@@ -189,15 +178,12 @@ class NonBlockingProcess(
           Source
             .queue[ByteString](stdoutBufferMaxChunks, OverflowStrategy.dropHead)
             .toMat(BroadcastHub.sink)(Keep.both)
-            .run()(stdioMaterializer)
+            .run()(mat)
         val (err, stderr) =
           Source
             .queue[ByteString](stderrBufferMaxChunks, OverflowStrategy.dropHead)
             .toMat(BroadcastHub.sink)(Keep.both)
-            .run()(stdioMaterializer)
-
-        def shutdownStdioMaterializer(): Unit =
-          synchronized(if (!stdioMaterializer.isShutdown) stdioMaterializer.shutdown())
+            .run()(mat)
 
         nuProcess.setProcessHandler(new NuAbstractProcessHandler {
           override def onStart(nuProcess: NuProcess): Unit =
@@ -205,19 +191,14 @@ class NonBlockingProcess(
 
           override def onStderr(buffer: ByteBuffer, closed: Boolean): Unit = {
             enqueue(err, buffer, stderrMaxBytesPerChunk, closed)
-            if (closed)
-              if (stdioMaterializerRefCount.decrementAndGet() == 0) shutdownStdioMaterializer()
           }
 
           override def onExit(exitCode: Int): Unit = {
             self ! Exited(exitCode)
-            if (exitCode == Int.MinValue || exitCode == Int.MaxValue) shutdownStdioMaterializer()
           }
 
           override def onStdout(buffer: ByteBuffer, closed: Boolean): Unit = {
             enqueue(out, buffer, stdoutMaxBytesPerChunk, closed)
-            if (closed)
-              if (stdioMaterializerRefCount.decrementAndGet() == 0) shutdownStdioMaterializer()
           }
         })
       }
